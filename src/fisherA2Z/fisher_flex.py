@@ -17,7 +17,7 @@ and replaces the three rigid pieces:
    ``sigma_e`` (see :mod:`fisherA2Z.flex_layout`);
 3. the number of tomographic bins is arbitrary.
 
-Three photo-z models are available, selected with ``nz_model``:
+Five photo-z models are available, selected with ``nz_model``:
 
 ``'shift_stretch'`` (default)
     The measured n(z) is its own template, with a shift ``zbias_i`` and a
@@ -37,12 +37,27 @@ Three photo-z models are available, selected with ``nz_model``:
 ``'no_uncertainty'``
     n(z) is taken as exactly known: **no photo-z parameters at all**, so
     ``nz_realizations`` is not needed and can be omitted.  This is the
-    perfect-photo-z limit, and therefore the optimistic bound the other two
+    perfect-photo-z limit, and therefore the optimistic bound the other
     models are measured against -- the difference in a constraint between this
     and ``'shift_stretch'`` is the cost of not knowing n(z).  Note it does *not*
     make the forecast insensitive to n(z): the n(z) still sets the kernels, and
     :meth:`FisherFlex.forecast_bias` still works and is at its most severe here,
     since nothing is free to absorb the systematic.
+``'quantiles'``
+    Configurable cumulative-probability levels (``n_quantiles=10`` by default),
+    with support endpoints fixed at the ends of ``z_grid``. Interior redshifts vary
+    independently through additive ``qshift{j}_{i}`` parameters per bin.
+    The fiducial is the quantile reconstruction of the input n(z); the prior
+    follows from the scatter of the same positions in the realizations.
+    Omitting both realizations and photoz_prior_cov leaves the quantiles free
+    without a photo-z prior; the survey covariance is still required.
+
+``'moments'``
+    Bounded maximum-entropy reconstruction constrained by raw moments.
+    ``n_moments`` includes the fixed normalization; the remaining moments vary
+    through additive ``mshift{k}_{i}`` parameters, with zero fiducial shifts.
+    Counts may differ between source bins. Priors come from moment scatter or
+    supplied per-bin covariance blocks, without an artificial variance floor.
 
 Usage is three steps::
 
@@ -94,6 +109,10 @@ from scipy.stats import norm, uniform
 from . import flex_layout as fl
 from . import nz_decomposition as nzd
 from . import nz_shift_stretch as nzs
+from . import nz_moments as nzm
+from . import nz_gaussian_outlier_pro as nzg
+from . import nz_gaussian_calibration as nzgc
+from . import nz_quantiles_v1 as nzq # OJO -> LA v1 ES LA ORIGINAL CON SAMPLES
 from .nz_decomposition import build_model_nz
 from .nz_shift_stretch import shift_stretch_nz
 
@@ -107,16 +126,29 @@ __all__ = ["FisherFlex", "FisherFlexResult", "FisherFlexBias", "Bias2D",
 
 _PACKAGE_PATH = os.path.dirname(os.path.abspath(__file__))
 
-#: Bumped to 2 when the shift-and-stretch photo-z model was added: the file now
-#: carries ``nz_model`` and ``pz_pivot``, and ``pz_prior_cov`` is
-#: ``(n_tomo, 2, 2)`` rather than ``(n_tomo, 3, 3)`` for that model.
-SCHEMA_VERSION = 2
-
+#: Version 4 adds variable per-bin moment counts and padded numeric prior blocks.
+#: Versions 2 and 3 remain readable for the original photo-z models.
+SCHEMA_VERSION = 5  # Adds Gaussian-convolution/mixing metadata; v2-v4 remain readable.
 #: Photo-z models understood by ``nz_model``.
-NZ_MODELS = ("shift_stretch", "gaussian_outlier", "no_uncertainty")
+NZ_MODELS = (
+    "shift_stretch", 
+    "gaussian_outlier", 
+    "no_uncertainty", 
+    "quantiles",
+    "moments",
+    "gaussian_outlier_pro",
+) 
+
 
 #: Photo-z parameters carried per source bin, by model.
-N_PZ_PER_BIN = {"shift_stretch": 2, "gaussian_outlier": 3, "no_uncertainty": 0}
+N_PZ_PER_BIN = {
+    "shift_stretch": 2, 
+    "gaussian_outlier": 3, 
+    "no_uncertainty": 0,
+    "quantiles": nzq.N_PARAMS,
+    "moments": None,  # configured independently in each source bin
+    "gaussian_outlier_pro": None,  # 2 or n_source+1 parameters per bin
+}
 
 #: Fiducial cosmology (Planck 2018-like), matching the A2Z paper.
 DEFAULT_COSMO_KWARGS = dict(
@@ -289,6 +321,9 @@ class _FlexModel:
     STATE_KEYS = (
         "z", "nz_model", "nz_source_fid", "pz_pivot",
         "nz_out", "pz_mu", "pz_sigma", "pz_fout",
+        "quantile_levels", "quantile_locs", "quantile_interpolation_order",
+        "moment_counts", "moment_fiducials",
+        "gpro_templates", "gpro_dz", "gpro_std_b", "gpro_c", "gpro_vary_mixing",
         "z_lens", "nz_lens", "ell", "cosmo_kwargs", "fid",
         "n_source", "n_lens",
         "ia_lf_cosmo", "omega_b_convention", "param_order",
@@ -336,6 +371,39 @@ class _FlexModel:
                     self.pz_pivot[i],
                 )
             return out
+        if self.nz_model == "quantiles":
+            for i in range(self.n_source):
+                params = [vals[f"qshift{j + 1}_{i + 1}"]
+                          for j in range(self.quantile_levels.size - 2)]
+                out[i] = nzq.evaluate_quantile_nz(
+                    self.z, self.quantile_levels, self.quantile_locs[i], params,
+                    interpolation_order=self.quantile_interpolation_order)
+            return out
+        if self.nz_model == "moments":
+            for i, count in enumerate(self.moment_counts):
+                delta = np.array([vals[f"mshift{k}_{i + 1}"]
+                                  for k in range(1, int(count))])
+                # Unchanged source PDFs are shared by all cosmology/IA probes.
+                if not np.any(delta):
+                    out[i] = self.nz_source_fid[i]
+                else:
+                    out[i] = nzm.evaluate_moment_nz(
+                        self.z, self.moment_fiducials[i, :count], delta)
+            return out
+        if self.nz_model == "gaussian_outlier_pro":
+            dz = np.array([vals[f"gdz{i + 1}"] for i in range(self.n_source)])
+            width = np.array([vals[f"gsigma{i + 1}"] for i in range(self.n_source)])
+            c = self.gpro_c.copy()
+            if self.gpro_vary_mixing:
+                for i in range(self.n_source):
+                    for j in range(self.n_source):
+                        if i != j:
+                            c[i, j] = vals[f"gc{i + 1}_{j + 1}"]
+            if (np.array_equal(dz, self.gpro_dz)
+                    and np.array_equal(width, self.gpro_std_b)
+                    and np.array_equal(c, self.gpro_c)):
+                return self.nz_source_fid.copy()
+            return nzg.evaluate_nz(self.gpro_templates, self.z, dz, width, c)
         for i in range(self.n_source):
             out[i] = build_model_nz(
                 self.z,
@@ -345,6 +413,8 @@ class _FlexModel:
                 self.nz_out[i],
             )
         return out
+
+    
 
     # -- tracers -------------------------------------------------------
     def legs(self, vals, nz_src=None):
@@ -375,9 +445,20 @@ class _FlexModel:
         if nz_src is None:
             nz_src = self.source_nz(vals)
         for i in range(self.n_source):
-            ia = _ai_for_nz(self.z, nz_src[i], ai_of_z) * ia0
+            if self.nz_model in ("quantiles", "moments", "gaussian_outlier_pro"):
+                # These models normalize using the piecewise-linear/trapezoid
+                # convention. Quantile cell averages additionally need these
+                # weights to avoid grid-phase noise at moving boundaries.
+                ai_mean = (np.trapz(ai_of_z * nz_src[i], self.z)
+                           / np.trapz(nz_src[i], self.z))
+                tracer_kwargs = {"n_samples": 2048}
+            else:
+                ai_mean = _ai_for_nz(self.z, nz_src[i], ai_of_z)
+                tracer_kwargs = {}
+            ia = ai_mean * ia0
             tracers.append(ccl.WeakLensingTracer(
-                cosmo, dndz=(self.z, nz_src[i]), ia_bias=(self.z, ia)
+                cosmo, dndz=(self.z, nz_src[i]), ia_bias=(self.z, ia),
+                **tracer_kwargs,
             ))
         return cosmo, tracers
 
@@ -911,18 +992,21 @@ class FisherFlex:
     nz_realizations : ndarray, shape (n_real, n_tomo, n_z) or (n_tomo, n_real, n_z), optional
         Realizations of the same n(z); their scatter sets the photo-z prior.
         Omit it and supply ``photoz_prior_cov`` directly, or omit both with
-        ``nz_model='no_uncertainty'``, which has no photo-z prior at all.
+        ``nz_model='no_uncertainty'`` (fixed n(z)) or ``'quantiles'``
+        (free interior locations without an external photo-z prior).
     z_grid : ndarray, shape (n_z,)
     neff_source : float or ndarray, shape (n_tomo,)
         Effective source number density per bin, arcmin^-2.
     fsky : float
+
     sigma_e : float
         Per-component ellipticity dispersion; the shape-noise power is
         ``sigma_e**2 / n``.
+
     cosmo : ccl.Cosmology, optional
         Fiducial cosmology.  Defaults to the A2Z Planck-like cosmology.
     mode : {'3x2pt', '2x2pt', 'cosmic_shear'}
-    nz_model : {'shift_stretch', 'gaussian_outlier', 'no_uncertainty'}
+    nz_model : {'shift_stretch', 'gaussian_outlier', 'no_uncertainty', 'quantiles', 'moments', 'gaussian_outlier_pro'}
         Photo-z parameterization; see the class docstring.  The default keeps
         the measured n(z) as its own template and gives each bin a shift and a
         stretch.  ``'no_uncertainty'`` treats n(z) as exactly known and adds no
@@ -930,9 +1014,45 @@ class FisherFlex:
         optimistic bound on any of the others.
         ``'gaussian_outlier'`` is the A2Z Gaussian-core-plus-outlier
         model, which adds a third parameter per bin.
+        ``'quantiles'`` uses configurable probability levels and free interior
+        quantile positions, with fixed support endpoints. 'moments' uses
+        bounded maximum entropy with free additive raw moments and fixed m0.
+    gaussian_outlier_pro_kwargs : dict, optional
+        Required for nz_model='gaussian_outlier_pro': dz, std_b and c specify
+        the fiducial convolution and mixing; vary_mixing=True also frees c.
+        dz and std_b are scalars or per-bin arrays, c is a zero-diagonal
+        (n_source, n_source) matrix whose rows sum to <= 1. std_b is the
+        Gaussian standard deviation in redshift units. Templates are nz_source.
+        Prior blocks follow nz_gaussian_outlier_pro.parameter_names order:
+        dz, std_b, then c[i,j] in increasing j excluding i. Omit the prior
+        for no external photo-z information.
+        With nz_realizations and vary_mixing=False, fit every realization,
+        set fiducials to mean fitted dz/std_b and use their covariance as prior.
+        Set calibration_n_jobs in this dict to control parallel fits; optional
+        calibration_max_realizations limits an explicitly reported evenly spaced
+        subset (default None uses every realization). c stays fixed. Gaussian
+        priors may poorly approximate boundary-limited width fits; diagnostics
+        are available as gpro_calibration. Cross-bin prior correlations are omitted.
+    z_realizations : ndarray, optional
+        Redshift grid for gaussian_outlier_pro realizations. Defaults to z_grid;
+        pass the native grid when samples and Fisher use different node counts.
+    n_moments : int or sequence of int, default 4
+        For nz_model='moments', number of raw moments INCLUDING the fixed
+        normalization m0=1. Each bin has n_moments[i]-1 additive mshift{k}_{bin}
+        parameters. A supplied prior is a list of square per-bin covariance
+        blocks; omitting both realizations and covariance leaves them free.
+        Reconstruction maximizes entropy on the bounded input support.
+    n_quantiles : int, default 10
+        Number of probability levels including both endpoints; equivalently
+        n_intervals + 1. There are n_quantiles - 2 free positions per source bin.
+    quantile_interpolation_order : int, optional
+        Polynomial degree of the reconstructed n(z): 0 constant, 1 linear,
+        2 quadratic (monotone PCHIP CDF), 3 cubic, etc. Defaults to the active
+        quantile module's INTERPOLATION_ORDER. A negative PDF is rejected.
+        This setting is saved with the derivatives and sent to every worker.
     step : float
         Default absolute step for the numerical derivatives.  Per-parameter
-        overrides are applied for ``zvariance`` and ``zoutlier`` (see
+        overrides are applied for ``zvariance``, ``zoutlier`` and ``qshift`` (see
         :attr:`param_step`).
     y1 : bool
         Use the LSST Y1 lens preset (5 bins, sigma_z = 0.06) instead of Y10.
@@ -948,6 +1068,7 @@ class FisherFlex:
         For ``'z_offset'``: require ``mean(z)_source > mean(z)_lens + offset``.
     prior_mode : {'full', 'diag'}
         Whether the photo-z prior keeps its per-bin correlations.
+
     smooth_realizations : float, optional
         Gaussian smoothing sigma in *z units* applied to the realizations
         before they are fitted.  Only relevant for ``'gaussian_outlier'``,
@@ -955,6 +1076,7 @@ class FisherFlex:
         the prior width by factors of a few; see
         :meth:`prior_stability_report`.  The shift-and-stretch parameters are
         moments of n(z), so they are already insensitive to it.
+        
     deriv_method : {'numdifftools', 'central', 'forward'}
     realizations_axis : {0, 1}, optional
         Which axis of ``nz_realizations`` indexes realizations.  Only needed
@@ -971,7 +1093,10 @@ class FisherFlex:
                  deriv_method="numdifftools", realizations_axis=None,
                  ia_lf_cosmo="varied", omega_b_convention="fixed_omega_m",
                  photoz_prior_cov=None, ell_edges=None, decompose_kwargs=None,
-                 verbose=True):
+                 verbose=True, n_quantiles=nzq.N_QUANTILES, n_moments=4,
+                 quantile_interpolation_order=None,
+                 gaussian_outlier_pro_kwargs=None, z_realizations=None):
+        # n_quantiles counts probability levels including both fixed endpoints.
         self.verbose = verbose
         self.mode = mode
         # Only ``nz_realizations`` is genuinely optional (nz_model
@@ -989,6 +1114,16 @@ class FisherFlex:
         if nz_model not in NZ_MODELS:
             raise ValueError(f"unknown nz_model {nz_model!r}; use one of {list(NZ_MODELS)}.")
         self.nz_model = nz_model
+        self.n_quantiles = n_quantiles
+        self.quantile_interpolation_order = nzq.validate_interpolation_order(
+            nzq.INTERPOLATION_ORDER if quantile_interpolation_order is None
+            else quantile_interpolation_order)
+        self.n_moments = n_moments
+        self.gaussian_outlier_pro_kwargs = dict(gaussian_outlier_pro_kwargs or {})
+        self.z_realizations = z_realizations
+        self.gpro_calibration = None
+        if z_realizations is not None and nz_model != "gaussian_outlier_pro":
+            raise ValueError("z_realizations is currently supported only by gaussian_outlier_pro.")
         self.step = float(step)
         self.y1 = bool(y1)
         self.prior_mode = prior_mode
@@ -1114,11 +1249,30 @@ class FisherFlex:
         """Build the per-bin n(z) template, fiducial parameters and prior."""
         self.smooth_realizations = smooth
         self.realization_params = None
+        self.pz_realization_offset = None
+        self.quantile_levels = np.empty(0, dtype=float)
+        self.quantile_locs = np.empty((self.n_source, 0), dtype=float)
         self.n_pz_per_bin = N_PZ_PER_BIN[self.nz_model]
+        self.moment_counts = np.empty(0, dtype=int)
+        self.moment_fiducials = np.empty((self.n_source, 0), dtype=float)
+        self.gpro_templates = np.empty((self.n_source, 0))
+        self.gpro_dz = np.empty(0)
+        self.gpro_std_b = np.empty(0)
+        self.gpro_c = np.empty((0, 0))
+        self.gpro_vary_mixing = False
+        if self.nz_model == "gaussian_outlier_pro":
+            self._setup_gaussian_outlier_pro(realizations, realizations_axis, smooth, prior_cov,
+                                              decompose_kwargs)
+            return
+        if self.nz_model == "moments":
+            self._setup_moments(realizations, realizations_axis, smooth, prior_cov,
+                                decompose_kwargs)
+            return
 
+        # Aquí se modifica para evitar que tome samples y prior_cov.
         if self.nz_model == "no_uncertainty":
             self._setup_no_uncertainty(decompose_kwargs)
-            if realizations is not None or prior_cov is not None:
+            if realizations is not None or prior_cov is not None: 
                 warnings.warn(
                     "nz_model='no_uncertainty' has no photo-z parameters, so "
                     "nz_realizations and photoz_prior_cov are ignored."
@@ -1129,8 +1283,12 @@ class FisherFlex:
 
         if self.nz_model == "shift_stretch":
             self._setup_shift_stretch(decompose_kwargs)
-        else:
+        elif self.nz_model == "gaussian_outlier":
             self._setup_gaussian_outlier(decompose_kwargs)
+        elif self.nz_model == "quantiles":
+            self._setup_quantiles(decompose_kwargs)
+        else:
+            raise ValueError(f"unknown nz_model {self.nz_model!r}.")
 
         if prior_cov is not None:
             self.pz_prior_cov = np.asarray(prior_cov, dtype=float)
@@ -1140,6 +1298,14 @@ class FisherFlex:
                     f"photoz_prior_cov must have shape ({self.n_source}, {k}, {k}) "
                     f"for nz_model={self.nz_model!r}."
                 )
+            if self.nz_model == "quantiles":
+                nzq.validate_prior_cov(self.pz_prior_cov, self.n_source, self.n_pz_per_bin)
+            return
+
+        if realizations is None and self.nz_model == "quantiles":
+            # Free quantiles, no external photo-z information. Infinite prior
+            # widths below contribute exactly zero precision to Fisher.
+            self.pz_prior_cov = None
             return
 
         if realizations is None:
@@ -1162,8 +1328,11 @@ class FisherFlex:
         if smooth:
             real = nzd.smooth_nz(self.z, real, smooth)
         self.realization_params = self._fit_realizations(real, decompose_kwargs)
-        self.pz_prior_cov = nzd.photoz_prior_from_realizations(
-            self.realization_params, mode=self.prior_mode)
+        if self.nz_model == "quantiles":
+            self.pz_prior_cov = self._quantile_prior_cov(self.realization_params)
+        else:
+            self.pz_prior_cov = nzd.photoz_prior_from_realizations(
+                self.realization_params, mode=self.prior_mode)
         self._check_prior_centring(self.realization_params)
 
     def _setup_shift_stretch(self, decompose_kwargs):
@@ -1217,18 +1386,203 @@ class FisherFlex:
         d = self.decomposition
         self.shift_stretch = None
         self.pz_mu = d.mu
-        self.pz_sigma = d.sigma
+        self.pz_sigma = d.sigma                       
         self.pz_pivot = d.mu
         self.pz_fout = d.f_out
         self.nz_out = d.nz_out
         self.nz_source_fid = d.nz_fid
         self.pz_degenerate = d.degenerate
 
+    def _setup_gaussian_outlier_pro(self, realizations, realizations_axis, smooth, prior_cov, decompose_kwargs):
+        if smooth is not None or decompose_kwargs:
+            raise ValueError("Smoothing/decomposition options do not apply to gaussian_outlier_pro.")
+        if self.prior_mode not in ("full", "diag"):
+            raise ValueError("prior_mode must be 'full' or 'diag'.")
+        config = dict(self.gaussian_outlier_pro_kwargs)
+        n_jobs = config.pop("calibration_n_jobs", min(4, os.cpu_count() or 1))
+        n_max = config.pop("calibration_max_realizations", None)
+        if not all(key in config for key in ("dz", "std_b", "c")):
+            raise ValueError("gaussian_outlier_pro_kwargs must explicitly supply dz, std_b and c.")
+        self.__dict__.update(nzg.configuration(self.z, self.nz_source, **config))
+        if realizations is not None:
+            if prior_cov is not None:
+                raise ValueError("Supply nz_realizations OR photoz_prior_cov, not both, for gaussian_outlier_pro.")
+            if self.gpro_vary_mixing:
+                raise ValueError("Automatic calibration requires vary_mixing=False; c is held fixed.")
+            real = nzd.orient_realizations(realizations, self.n_source, realizations_axis)
+            z_real = self.z if self.z_realizations is None else np.asarray(self.z_realizations, dtype=float)
+            if real.shape[-1] != z_real.size:
+                raise ValueError("samples use a different grid: pass z_realizations=z_native "
+                                 "with one node per realization redshift column.")
+            if isinstance(n_jobs, bool) or int(n_jobs) != n_jobs or n_jobs < 1:
+                raise ValueError("calibration_n_jobs must be a positive integer.")
+            n_total = real.shape[0]
+            if n_max is not None:
+                if isinstance(n_max, bool) or int(n_max) != n_max or n_max <= 2:
+                    raise ValueError("calibration_max_realizations must be an integer >2 or None.")
+                indices = np.linspace(0, n_total-1, min(int(n_max), n_total), dtype=int)
+                real = real[indices]
+            self._log(f"Fitting Gaussian convolution parameters: {real.shape[0]}/{n_total} "
+                      f"realizations x {self.n_source} bins, {int(n_jobs)} processes ...")
+            last_percent = [-1]
+            def progress(done, total):
+                percent = int(100*done/total)
+                if percent//5 != last_percent[0]//5 or done == total:
+                    self._log(f"Gaussian calibration: {percent}% ({done}/{total} fits)")
+                    last_percent[0] = percent
+            if int(n_jobs) == 1:
+                params, report = nzgc.fit_ensemble(
+                    self.z, self.gpro_templates, z_real, real, self.gpro_c, progress=progress)
+            else:
+                # Same notebook-safe pool creation used by the spectrum derivatives.
+                with _suppress_main_fixup():
+                    pool = mp.get_context(DEFAULT_MP_CONTEXT).Pool(int(n_jobs))
+                try:
+                    params, report = nzgc.fit_ensemble(
+                        self.z, self.gpro_templates, z_real, real, self.gpro_c,
+                        pool=pool, progress=progress)
+                finally:
+                    pool.terminate()
+                    pool.join()
+            report["n_available_realizations"] = n_total
+            report["subsampled"] = real.shape[0] != n_total
+            fid = params.mean(axis=0)
+            self.gpro_dz, self.gpro_std_b = fid[:,0], fid[:,1]
+            prior_cov = np.stack([np.cov(params[:,b], rowvar=False, ddof=1)
+                                  for b in range(self.n_source)])
+            self.realization_params = params
+            self.pz_realization_offset = np.zeros_like(fid)
+            self.gpro_calibration = report
+            fraction = np.asarray(report["boundary_fraction"])
+            if np.any(fraction > 0.05):
+                warnings.warn("Gaussian calibration: fractions of fits at minimum width = "
+                              f"{np.round(fraction,3).tolist()}. The empirical prior is a "
+                              "Gaussian approximation to boundary-limited fits, not evidence "
+                              "of an interior width measurement. Inspect gpro_calibration.")
+            # Do not replace zero/singular scatter with an invented prior floor.
+            if np.any(np.std(params[:,:,1], axis=0, ddof=1) < 1e-8*report["lower_width"]):
+                raise ValueError("All fitted widths coincide at the numerical boundary in a bin; "
+                                 "no width prior can be estimated from this ensemble.")
+        self.n_pz_per_bin = len(nzg.parameter_names(0, self.n_source, self.gpro_vary_mixing))
+        self.nz_source_fid = nzg.evaluate_nz(
+            self.gpro_templates, self.z, self.gpro_dz, self.gpro_std_b, self.gpro_c)
+        self.pz_mu = np.trapz(self.nz_source_fid * self.z, self.z, axis=1)
+        self.pz_pivot = self.pz_mu.copy()
+        self.pz_sigma = np.sqrt(np.trapz(
+            self.nz_source_fid * (self.z - self.pz_mu[:, None])**2, self.z, axis=1))
+        self.pz_fout = nzg.outlier_fraction(self.gpro_c)
+        self.pz_degenerate = np.zeros(self.n_source, dtype=bool)
+        self.nz_out = np.empty((0, 0))
+        self.decomposition = self.shift_stretch = None
+        self.pz_prior_cov = nzg.validate_prior_cov(prior_cov, self.n_source, self.gpro_vary_mixing)
+
+    def _setup_quantiles(self, decompose_kwargs):
+        if decompose_kwargs:
+            raise ValueError("decompose_kwargs is not used by nz_model='quantiles'.")
+        m = nzq.build_quantile_model(
+            self.z, self.nz_source, n_quantiles=self.n_quantiles,
+            interpolation_order=self.quantile_interpolation_order)
+        self.decomposition = None
+        self.shift_stretch = None
+        self.nz_source_fid = m.nz_fid
+        self.n_pz_per_bin = m.levels.size - 2
+        self.quantile_levels = m.levels
+        self.quantile_locs = m.locs
+        self.pz_pivot = m.pivot
+        self.pz_mu = m.pivot
+        self.pz_sigma = m.sigma
+        self.pz_fout = np.zeros(self.n_source)
+        self.nz_out = np.zeros((0, 0))
+        self.pz_degenerate = np.zeros(self.n_source, dtype=bool)
+
+    def _setup_moments(self, realizations, realizations_axis, smooth, prior_cov,
+                       decompose_kwargs):
+        if decompose_kwargs:
+            raise ValueError("decompose_kwargs is not used by nz_model='moments'.")
+        if self.prior_mode not in ("full", "diag"):
+            raise ValueError("prior_mode must be 'full' or 'diag'.")
+        model = nzm.build_moment_model(self.z, self.nz_source, self.n_moments)
+        self.moment_counts = np.asarray(model.n_moments, dtype=int)
+        self.n_moments = self.moment_counts.copy()
+        self.n_pz_per_bin = self.moment_counts - 1
+        self.moment_fiducials = np.zeros((self.n_source, int(self.moment_counts.max())))
+        for i, moments in enumerate(model.moments):
+            self.moment_fiducials[i, :len(moments)] = moments
+        self.decomposition = None
+        self.shift_stretch = None
+        self.nz_source_fid = model.nz_fid
+        self.pz_pivot = model.pivot
+        self.pz_mu = model.pivot
+        self.pz_sigma = model.sigma
+        self.pz_fout = np.zeros(self.n_source)
+        self.nz_out = np.zeros((0, 0))
+        self.pz_degenerate = np.zeros(self.n_source, dtype=bool)
+        if prior_cov is not None:
+            self.pz_prior_cov = nzm.validate_prior_cov(prior_cov, self.moment_counts)
+            return
+        if realizations is None:
+            self.pz_prior_cov = None
+            return
+        real = nzd.orient_realizations(realizations, self.n_source, realizations_axis)
+        if smooth:
+            real = nzd.smooth_nz(self.z, real, smooth)
+        self.realization_params = self._fit_realizations(real, {})
+        self.pz_prior_cov = self._moment_prior_cov(self.realization_params)
+        self._check_prior_centring(self.realization_params)
+
+    def _moment_prior_cov(self, params):
+        blocks = []
+        for i, (values, count) in enumerate(zip(params, self.moment_counts)):
+            values = np.asarray(values, dtype=float)
+            if (values.ndim != 2 or values.shape[1] != count - 1
+                    or values.shape[0] <= count - 1 or not np.all(np.isfinite(values))):
+                raise ValueError(f"Insufficient/invalid moment realizations in bin {i + 1}.")
+            cov = np.atleast_2d(np.cov(values, rowvar=False, ddof=1))
+            if self.prior_mode == "diag":
+                cov = np.diag(np.diag(cov))
+            blocks.append(cov)
+        return nzm.validate_prior_cov(blocks, self.moment_counts)
+
+    def _stored_photoz_prior(self):
+        if self.pz_prior_cov is None:
+            return np.empty((self.n_source, 0, 0))
+        if self.nz_model != "moments":
+            return self.pz_prior_cov
+        kmax = int(np.max(self.n_pz_per_bin))
+        packed = np.zeros((self.n_source, kmax, kmax))
+        for i, block in enumerate(self.pz_prior_cov):
+            k = int(self.n_pz_per_bin[i])
+            packed[i, :k, :k] = block
+        return packed
+
+    def _quantile_prior_cov(self, params):
+        """Empirical per-bin covariance without artificial variance floors."""
+        params = np.asarray(params, dtype=float)
+        if params.ndim != 3 or params.shape[1:] != (self.n_source, self.n_pz_per_bin):
+            raise ValueError("quantile realization parameters have an invalid shape.")
+        if params.shape[0] < 2 or not np.all(np.isfinite(params)):
+            raise ValueError("at least two finite quantile realizations are required.")
+        if self.prior_mode not in ("full", "diag"):
+            raise ValueError("prior_mode must be 'full' or 'diag'.")
+        cov = np.stack([np.atleast_2d(np.cov(params[:, i, :], rowvar=False, ddof=1))
+                        for i in range(self.n_source)])
+        if self.prior_mode == "diag":
+            cov = np.stack([np.diag(np.diag(c)) for c in cov])
+        nzq.validate_prior_cov(cov, self.n_source, self.n_pz_per_bin)
+        return cov
+
     def _fit_realizations(self, real, decompose_kwargs):
+        if self.nz_model == "moments":
+            fid = tuple(self.moment_fiducials[i, :count]
+                        for i, count in enumerate(self.moment_counts))
+            return nzm.fit_moments(self.z, real, self.moment_counts, fid)
         if self.nz_model == "shift_stretch":
             self._log(f"Measuring the shift and stretch of {real.shape[0]} "
                       f"realizations ...")
             return nzs.fit_shift_stretch(self.z, self.nz_source_fid, real)
+        if self.nz_model == "quantiles":
+            return nzq.fit_quantiles(self.z, self.nz_source, real,
+                                     self.quantile_levels, self.quantile_locs)
         self._log(f"Fitting {real.shape[0]} realizations x {self.n_source} bins ...")
         return nzd.decompose_realizations(
             self.z, real,
@@ -1242,12 +1596,39 @@ class FisherFlex:
         larger than that scatter means the two inputs describe different
         samples -- almost always a mix-up rather than a real feature.
 
-        Only checked for ``'shift_stretch'``, where the estimator is a plain
-        moment and the offset means exactly one thing.  The Gaussian fit's
+        Quantile offsets are checked in their eight displacement coordinates;
+        their means need not vanish even when the fiducial PDF is the mean PDF,
+        because taking a quantile is nonlinear. This diagnostic never recentres
+        the fiducial parameters or substitutes an assumed prior mean.
+
+        For ``'shift_stretch'`` the estimator is a plain moment. The Gaussian fit's
         ``mu`` is a biased order statistic on noisy realizations, so the same
         comparison there would mix that bias with a genuine mismatch and fire
         when nothing is wrong.
         """
+        if self.nz_model == "moments":
+            self.pz_realization_offset = tuple(np.mean(x, axis=0) for x in params)
+            bad = []
+            for i, (offset, values) in enumerate(zip(self.pz_realization_offset, params)):
+                scatter = np.std(values, axis=0, ddof=1)
+                bad.extend(self._pz_param_names(i)[j]
+                           for j in np.flatnonzero(np.abs(offset) > scatter))
+            if bad:
+                warnings.warn(f"Mean moment displacements exceed their scatter for {bad}; "
+                              "inspect pz_realization_offset. No prior mean was changed.")
+            return
+        if self.nz_model == "quantiles":
+            self.pz_realization_offset = np.mean(params, axis=0)
+            scatter = np.std(params, axis=0, ddof=1)
+            bad = np.abs(self.pz_realization_offset) > scatter
+            if np.any(bad):
+                names = [self._pz_param_names(i)[j] for i, j in np.argwhere(bad)]
+                warnings.warn(
+                    "mean quantile displacements exceed their realization scatter "
+                    f"for {names}; inspect pz_realization_offset before treating "
+                    "the empirical covariance as a prior centred on the fiducial. "
+                    "No fiducial or prior mean has been changed.")
+            return
         if self.nz_model != "shift_stretch":
             self.pz_realization_offset = None
             return
@@ -1266,8 +1647,10 @@ class FisherFlex:
             )
 
     def _resolve_ggl_pairs(self, spec, offset):
+        source_for_pairs = (self.nz_source_fid if self.nz_model == "gaussian_outlier_pro"
+                            else self.nz_source)
         z_src = np.array([np.trapz(self.z * n, self.z) / np.trapz(n, self.z)
-                            for n in self.nz_source])
+                            for n in source_for_pairs])
         self.z_mean_source = z_src
         if isinstance(spec, str):
             if spec == "z_offset":
@@ -1287,12 +1670,19 @@ class FisherFlex:
         The order matches the rows and columns of ``pz_prior_cov[i]``.  Empty
         for ``nz_model='no_uncertainty'``.
         """
+        if self.nz_model == "gaussian_outlier_pro":
+            return nzg.parameter_names(i, self.n_source, self.gpro_vary_mixing)
+        if self.nz_model == "moments":
+            return [f"mshift{k}_{i + 1}" for k in range(1, int(self.moment_counts[i]))]
+        if self.nz_model == "quantiles":
+            return [f"qshift{j + 1}_{i + 1}" for j in range(self.quantile_levels.size - 2)]
         if self.nz_model == "no_uncertainty":
             return []
         if self.nz_model == "shift_stretch":
             return [f"zbias{i + 1}", f"zstretch{i + 1}"]
         return [f"zbias{i + 1}", f"zvariance{i + 1}", f"zoutlier{i + 1}"]
 
+    # Otra modificación hecha. Anchura finita
     def _setup_params(self):
         ns, nl = self.n_source, self.n_lens
         if self.nz_model == "no_uncertainty":
@@ -1302,6 +1692,21 @@ class FisherFlex:
                         + [f"zstretch{i}" for i in range(1, ns + 1)])
             pz_labels = ([rf"$\delta z_{{{i}}}$" for i in range(1, ns + 1)]
                          + [rf"$s_{{z,{i}}}$" for i in range(1, ns + 1)])
+        elif self.nz_model == "gaussian_outlier_pro":
+            pz_names = [name for i in range(ns) for name in self._pz_param_names(i)]
+            pz_labels = []
+            for i in range(ns):
+                pz_labels += [rf"$\Delta z_{{{i+1}}}$", rf"$s_{{G,{i+1}}}$"]
+                if self.gpro_vary_mixing:
+                    pz_labels += [rf"$c_{{{i+1},{j+1}}}$" for j in range(ns) if j != i]
+        elif self.nz_model == "moments":
+            pz_names = [name for i in range(ns) for name in self._pz_param_names(i)]
+            pz_labels = [rf"$\delta m_{{{k},{i + 1}}}$"
+                         for i in range(ns) for k in range(1, int(self.moment_counts[i]))]
+        elif self.nz_model == "quantiles":
+            pz_names = [name for i in range(ns) for name in self._pz_param_names(i)]
+            pz_labels = [rf"$\delta q_{{{j + 1},{i + 1}}}$"
+                         for i in range(ns) for j in range(self.quantile_levels.size - 2)]
         else:
             pz_names = ([f"zbias{i}" for i in range(1, ns + 1)]
                         + [f"zvariance{i}" for i in range(1, ns + 1)]
@@ -1335,6 +1740,16 @@ class FisherFlex:
         for i in range(ns):
             if self.nz_model == "no_uncertainty":
                 break
+            if self.nz_model in ("quantiles", "moments"):
+                for name in self._pz_param_names(i):
+                    self.fid[name] = 0.0
+                continue
+            if self.nz_model == "gaussian_outlier_pro":
+                values = [self.gpro_dz[i], self.gpro_std_b[i]]
+                if self.gpro_vary_mixing:
+                    values += [self.gpro_c[i, j] for j in range(ns) if j != i]
+                self.fid.update(zip(self._pz_param_names(i), map(float, values)))
+                continue
             self.fid[f"zbias{i + 1}"] = 0.0
             if self.nz_model == "shift_stretch":
                 self.fid[f"zstretch{i + 1}"] = 1.0
@@ -1352,7 +1767,8 @@ class FisherFlex:
         for i in range(nl):
             self.prior_sigma[f"gbias{i + 1}"] = GBIAS_PRIOR_SIGMA
         for i in range(ns):
-            sd = np.sqrt(np.diag(self.pz_prior_cov[i]))
+            sd = (np.full(len(self._pz_param_names(i)), np.inf) if self.pz_prior_cov is None
+                  else np.sqrt(np.diag(self.pz_prior_cov[i])))
             for k, name in enumerate(self._pz_param_names(i)):
                 self.prior_sigma[name] = float(sd[k])
 
@@ -1379,6 +1795,43 @@ class FisherFlex:
                 p = f"zoutlier{i + 1}"
                 if self.fid[p] < 2.0 * self.param_step[p]:
                     self.param_deriv_method[p] = "forward"
+        elif self.nz_model == "moments":
+            for i, count in enumerate(self.moment_counts):
+                steps = nzm.recommended_steps(
+                    self.z, self.moment_fiducials[i, :count], self.step)
+                for name, h in zip(self._pz_param_names(i), steps):
+                    self.param_step[name] = float(h)
+                    self.param_deriv_method[name] = "central"
+        elif self.nz_model == "gaussian_outlier_pro":
+            if not np.isfinite(self.step) or self.step <= 0:
+                raise ValueError("step must be positive and finite.")
+            for i in range(ns):
+                width = self.gpro_std_b[i]
+                for name in self._pz_param_names(i):
+                    self.param_deriv_method[name] = "central"
+                    self.param_step[name] = min(self.step, 0.01 * width)
+                # Keep both width evaluations on a resolved, positive kernel.
+                self.param_step[f"gsigma{i+1}"] = min(
+                    self.param_step[f"gsigma{i+1}"],
+                    0.25 * (width - 2 * np.max(np.diff(self.z))))
+                if self.gpro_vary_mixing:
+                    room = 1 - self.gpro_c[i].sum()
+                    for j in range(ns):
+                        if j == i:
+                            continue
+                        name, value = f"gc{i+1}_{j+1}", self.gpro_c[i, j]
+                        self.param_step[name] = min(self.step, 1e-4, room / 4)
+                        if value > 0:
+                            self.param_step[name] = min(self.param_step[name], value / 4)
+                        else:
+                            # Boundary derivative; no negative mixing fractions.
+                            self.param_deriv_method[name] = "forward"
+        elif self.nz_model == "quantiles":
+            steps = nzq.recommended_steps(self.quantile_locs, self.step)
+            for i in range(ns):
+                for j, name in enumerate(self._pz_param_names(i)):
+                    self.param_step[name] = float(steps[i, j])
+                    self.param_deriv_method[name] = "central"
 
     def override_priors(self, priors):
         """Replace individual prior widths, ``{param: sigma}``."""
@@ -1409,6 +1862,14 @@ class FisherFlex:
             pz_mu=self.pz_mu,
             pz_sigma=self.pz_sigma,
             pz_fout=self.pz_fout,
+            quantile_levels=self.quantile_levels,
+            quantile_locs=self.quantile_locs,
+            quantile_interpolation_order=self.quantile_interpolation_order,
+            moment_counts=self.moment_counts,
+            moment_fiducials=self.moment_fiducials,
+            gpro_templates=self.gpro_templates,
+            gpro_dz=self.gpro_dz, gpro_std_b=self.gpro_std_b,
+            gpro_c=self.gpro_c, gpro_vary_mixing=self.gpro_vary_mixing,
             z_lens=self.z_lens,
             nz_lens=self.nz_lens,
             ell=self.ell,
@@ -1557,11 +2018,18 @@ class FisherFlex:
             )
         real = nzd.orient_realizations(realizations, self.n_source, realizations_axis)
         real = real[:n_max]
+        if self.nz_model == "gaussian_outlier_pro":
+            raise ValueError("prior_stability_report does not implement a smoothing scan for gaussian_outlier_pro; inspect gpro_calibration.")
         out = {}
         for s in smooth_grid:
             r = nzd.smooth_nz(self.z, real, s) if s > 0 else real
             p = self._fit_realizations(r, {})
-            cov = nzd.photoz_prior_from_realizations(p, mode=self.prior_mode)
+            if self.nz_model == "moments":
+                cov = self._moment_prior_cov(p)
+                out[float(s)] = tuple(np.sqrt(np.diag(c)) for c in cov)
+                continue
+            cov = (self._quantile_prior_cov(p) if self.nz_model == "quantiles"
+                   else nzd.photoz_prior_from_realizations(p, mode=self.prior_mode))
             out[float(s)] = np.sqrt(np.diagonal(cov, axis1=1, axis2=2))
         return out
 
@@ -1581,6 +2049,7 @@ class FisherFlex:
             mode=self.mode,
             nz_model=self.nz_model,
             deriv_method=self.deriv_method,
+            n_pz_per_bin=self.n_pz_per_bin,
             # grids
             ell=self.ell, ell_edges=self.ell_edges, z_grid=self.z,
             # parameters
@@ -1588,6 +2057,8 @@ class FisherFlex:
             param_labels=np.array(self.param_labels),
             param_fid=np.array([self.fid[p] for p in self.param_order]),
             param_step=np.array([self.param_step[p] for p in self.param_order]),
+            param_deriv_method=np.array([
+                self.param_deriv_method.get(p) or "" for p in self.param_order]),
             param_prior_sigma=np.array(
                 [self.prior_sigma[p] for p in self.param_order]),
             # layout
@@ -1609,8 +2080,21 @@ class FisherFlex:
             z_lens=self.z_lens, nz_lens=self.nz_lens,
             pz_mu_fid=self.pz_mu, pz_sigma_fid=self.pz_sigma,
             pz_pivot=self.pz_pivot,
-            pz_fout_fid=self.pz_fout, pz_prior_cov=self.pz_prior_cov,
+            pz_fout_fid=self.pz_fout,
+            pz_prior_cov=self._stored_photoz_prior(),
             pz_degenerate=self.pz_degenerate, gbias_fid=self.gbias,
+            quantile_levels=self.quantile_levels,
+            quantile_locs=self.quantile_locs,
+            quantile_interpolation_version=nzq.INTERPOLATION_VERSION,
+            quantile_interpolation_order=self.quantile_interpolation_order,
+            moment_counts=self.moment_counts,
+            moment_model_version=(nzm.MODEL_VERSION if self.nz_model == "moments" else ""),
+            gpro_model_version=(nzg.MODEL_VERSION if self.nz_model == "gaussian_outlier_pro" else ""),
+            gpro_calibration_json=json.dumps(getattr(self, "gpro_calibration", None)),
+            moment_fiducials=self.moment_fiducials,
+            gpro_templates=self.gpro_templates,
+            gpro_dz=self.gpro_dz, gpro_std_b=self.gpro_std_b,
+            gpro_c=self.gpro_c, gpro_vary_mixing=self.gpro_vary_mixing,
             # scale cuts
             z_eff_lens=self.z_eff_lens,
             chi_eff_lens_Mpc=self.chi_eff_lens_Mpc,
@@ -1638,13 +2122,109 @@ class FisherFlex:
         """
         d = np.load(path, allow_pickle=False)
         v = int(d["schema_version"])
-        if v != SCHEMA_VERSION:
+        if v not in (2, 3, 4, SCHEMA_VERSION):
             raise ValueError(
                 f"{path} has schema_version {v}, this fisherA2Z expects "
                 f"{SCHEMA_VERSION}. Recompute with compute(save=...)."
             )
         on_disk_mode = str(d["mode"])
         on_disk_nz_model = str(d["nz_model"])
+        if on_disk_nz_model not in NZ_MODELS:
+            raise ValueError(f"{path} uses an unsupported nz_model={on_disk_nz_model!r}.")
+        stored_ns = int(d["n_tomo_source"])
+        if on_disk_nz_model == "quantiles":
+            if v < 3:
+                raise ValueError("quantile precomputations require schema_version 3.")
+            required = ("quantile_levels", "quantile_locs", "n_pz_per_bin")
+            if any(key not in d for key in required):
+                raise ValueError("quantile precomputation is missing its model metadata.")
+            if ("quantile_interpolation_order" not in d
+                    or "quantile_interpolation_version" not in d
+                    or str(d["quantile_interpolation_version"]) != nzq.INTERPOLATION_VERSION):
+                raise ValueError(
+                    "This quantile NPZ does not identify a compatible interpolation order. "
+                    "Recompute with compute(save=...) before using this model.")
+            interpolation_order = nzq.validate_interpolation_order(
+                d["quantile_interpolation_order"].item())
+            levels = np.asarray(d["quantile_levels"], dtype=float)
+            locs = np.asarray(d["quantile_locs"], dtype=float)
+            if (levels.ndim != 1 or levels.size < 3
+                    or int(d["n_pz_per_bin"]) != levels.size - 2
+                    or locs.shape != (stored_ns, levels.size)):
+                raise ValueError("quantile precomputation has incompatible dimensions.")
+            # Validate support, ordering and finiteness through the same model
+            # path used to construct the fiducial data vector.
+            for loc in locs:
+                nzq.evaluate_quantile_nz(d["z_grid"], levels, loc,
+                                         np.zeros(levels.size - 2), interpolation_order)
+            if d["pz_prior_cov"].shape != (stored_ns, 0, 0):
+                nzq.validate_prior_cov(d["pz_prior_cov"], stored_ns, levels.size - 2)
+        else:
+            interpolation_order = nzq.INTERPOLATION_ORDER
+            levels = np.empty(0, dtype=float)
+            locs = np.empty((stored_ns, 0), dtype=float)
+        counts = np.empty(0, dtype=int)
+        moment_fid = np.empty((stored_ns, 0))
+        moment_prior = None
+        if on_disk_nz_model == "moments":
+            stored_version = str(d["moment_model_version"]) if "moment_model_version" in d else ""
+            if stored_version != nzm.MODEL_VERSION:
+                raise ValueError(
+                    "This file uses an older/different moment reconstruction. "
+                    "Recompute derivatives with the continuous maximum-entropy model; "
+                    "do not reuse the old moment Fisher NPZ."
+                )
+            required = ("moment_counts", "moment_fiducials", "n_pz_per_bin")
+            if v < 4 or any(key not in d for key in required):
+                raise ValueError("Moment precomputations require schema 4 and model metadata.")
+            raw_counts = np.asarray(d["moment_counts"])
+            if (raw_counts.shape != (stored_ns,) or not np.all(np.isfinite(raw_counts))
+                    or np.any(raw_counts < 2) or np.any(raw_counts != np.floor(raw_counts))):
+                raise ValueError("Invalid stored moment counts.")
+            counts = raw_counts.astype(int)
+            moment_fid = np.asarray(d["moment_fiducials"], dtype=float)
+            if (moment_fid.shape != (stored_ns, int(counts.max()))
+                    or not np.all(np.isfinite(moment_fid))
+                    or not np.allclose(moment_fid[:, 0], 1., rtol=0, atol=1e-12)
+                    or not np.array_equal(d["n_pz_per_bin"], counts - 1)):
+                raise ValueError("Invalid stored moment fiducials/dimensions.")
+            packed = np.asarray(d["pz_prior_cov"], dtype=float)
+            if packed.shape != (stored_ns, 0, 0):
+                maxk = int(counts.max()) - 1
+                if packed.shape != (stored_ns, maxk, maxk) or not np.all(np.isfinite(packed)):
+                    raise ValueError("Invalid packed moment prior dimensions.")
+                blocks = []
+                for i, count in enumerate(counts):
+                    k = count - 1
+                    if np.any(packed[i, k:, :]) or np.any(packed[i, :, k:]):
+                        raise ValueError("Nonzero padding in stored moment prior.")
+                    blocks.append(packed[i, :k, :k])
+                moment_prior = nzm.validate_prior_cov(blocks, counts)
+        gpro = dict(gpro_templates=np.empty((stored_ns, 0)), gpro_dz=np.empty(0),
+                    gpro_std_b=np.empty(0), gpro_c=np.empty((0, 0)), gpro_vary_mixing=False)
+        gpro_prior = None
+        if on_disk_nz_model == "gaussian_outlier_pro":
+            required = tuple(gpro) + ("gpro_model_version",)
+            if (v < 5 or any(key not in d for key in required)
+                    or str(d["gpro_model_version"]) != nzg.MODEL_VERSION):
+                raise ValueError("Incompatible Gaussian convolution/mixing cache; recompute derivatives.")
+            # Validate stored metadata without changing the saved numerical templates.
+            nzg.configuration(d["z_grid"], d["gpro_templates"], dz=d["gpro_dz"],
+                              std_b=d["gpro_std_b"], c=d["gpro_c"],
+                              vary_mixing=d["gpro_vary_mixing"].item())
+            gpro = {key: d[key] for key in gpro}
+            gpro["gpro_vary_mixing"] = bool(gpro["gpro_vary_mixing"])
+            k = len(nzg.parameter_names(0, stored_ns, gpro["gpro_vary_mixing"]))
+            if (d["gpro_templates"].shape != d["nz_source_fid"].shape
+                    or int(d["n_pz_per_bin"]) != k):
+                raise ValueError("Inconsistent Gaussian convolution/mixing cache dimensions.")
+            expected = [name for i in range(stored_ns)
+                        for name in nzg.parameter_names(i, stored_ns, gpro["gpro_vary_mixing"])]
+            actual = [str(name) for name in d["param_names"] if str(name).startswith(("gdz", "gsigma", "gc"))]
+            if actual != expected:
+                raise ValueError("Inconsistent Gaussian convolution/mixing parameter names.")
+            if d["pz_prior_cov"].shape != (stored_ns, 0, 0):
+                gpro_prior = nzg.validate_prior_cov(d["pz_prior_cov"], stored_ns, gpro["gpro_vary_mixing"])
         if check_consistency:
             if on_disk_mode != self.mode:
                 warnings.warn(
@@ -1655,6 +2235,36 @@ class FisherFlex:
             # run the photo-z setup (the tests do exactly that), in which case
             # there is nothing to compare against and nothing to warn about.
             live_nz_model = getattr(self, "nz_model", None)
+            if (live_nz_model is not None and live_nz_model != on_disk_nz_model
+                    and any(m in ("quantiles", "moments", "gaussian_outlier_pro")
+                            for m in (live_nz_model, on_disk_nz_model))):
+                raise ValueError(
+                    "cannot reuse precomputations across custom photo-z models and another "
+                    "n(z) model; recompute, or use FisherFlex.from_npz(path) to "
+                    "forecast with the saved model.")
+            if live_nz_model == on_disk_nz_model == "gaussian_outlier_pro":
+                for name, stored in list(gpro.items()) + [("z", d["z_grid"])]:
+                    live = getattr(self, name, None)
+                    if live is not None and not np.array_equal(live, stored):
+                        raise ValueError(f"{path} has different {name}; recompute this Gaussian model.")
+            if live_nz_model == on_disk_nz_model == "moments":
+                for name, stored in (("moment_counts", counts),
+                                     ("moment_fiducials", moment_fid),
+                                     ("z", d["z_grid"])):
+                    live = getattr(self, name, None)
+                    if live is not None and not np.array_equal(live, stored):
+                        raise ValueError(f"{path} has different {name}; recompute for this moment model.")
+            if live_nz_model == on_disk_nz_model == "quantiles":
+                if self.quantile_interpolation_order != interpolation_order:
+                    raise ValueError("Different quantile interpolation order; recompute derivatives.")
+                for name, stored in (("quantile_levels", levels),
+                                     ("quantile_locs", locs),
+                                     ("z", d["z_grid"])):
+                    live = getattr(self, name, None)
+                    if live is not None and not np.array_equal(live, stored):
+                        raise ValueError(
+                            f"{path} has different {name}; recompute derivatives "
+                            "for the current quantile model.")
             if live_nz_model is not None and on_disk_nz_model != live_nz_model:
                 warnings.warn(
                     f"{path} was computed with nz_model={on_disk_nz_model!r} but "
@@ -1683,6 +2293,11 @@ class FisherFlex:
         self.param_labels = [str(s) for s in d["param_labels"]]
         self.fid = dict(zip(self.param_order, d["param_fid"].tolist()))
         self.param_step = dict(zip(self.param_order, d["param_step"].tolist()))
+        if "param_deriv_method" in d:
+            self.param_deriv_method = dict(zip(
+                self.param_order, [str(s) or None for s in d["param_deriv_method"]]))
+        else:
+            self.param_deriv_method = {p: None for p in self.param_order}
         self.prior_sigma = dict(
             zip(self.param_order, d["param_prior_sigma"].tolist()))
         self.pz_prior_cov = d["pz_prior_cov"]
@@ -1694,7 +2309,25 @@ class FisherFlex:
         self.mode = on_disk_mode
         # forecast() needs this to group the photo-z parameters for the prior.
         self.nz_model = on_disk_nz_model
-        self.n_pz_per_bin = N_PZ_PER_BIN[on_disk_nz_model]
+        self.n_pz_per_bin = (levels.size - 2 if on_disk_nz_model == "quantiles"
+                             else N_PZ_PER_BIN[on_disk_nz_model])
+        self.n_quantiles = levels.size if on_disk_nz_model == "quantiles" else nzq.N_QUANTILES
+        if on_disk_nz_model == "quantiles" and self.pz_prior_cov.shape == (stored_ns, 0, 0):
+            self.pz_prior_cov = None
+        self.quantile_interpolation_order = interpolation_order
+        self.quantile_levels = levels
+        self.quantile_locs = locs
+        self.moment_counts = counts
+        self.moment_fiducials = moment_fid
+        self.n_moments = counts.copy() if on_disk_nz_model == "moments" else 4
+        if on_disk_nz_model == "moments":
+            self.n_pz_per_bin = counts - 1
+            self.pz_prior_cov = moment_prior
+        self.__dict__.update(gpro)
+        self.gpro_calibration = json.loads(str(d["gpro_calibration_json"])) if "gpro_calibration_json" in d else None
+        if on_disk_nz_model == "gaussian_outlier_pro":
+            self.n_pz_per_bin = k
+            self.pz_prior_cov = gpro_prior
         self._computed = True
         self._log(f"Loaded precomputed derivatives and covariance from {path}")
         return self
@@ -1721,6 +2354,7 @@ class FisherFlex:
         obj.pz_sigma = d["pz_sigma_fid"]
         obj.pz_pivot = d["pz_pivot"]
         obj.pz_fout = d["pz_fout_fid"]
+        obj.pz_degenerate = d["pz_degenerate"]
         obj.nz_out = d["nz_out_source"]
         obj.nz_source_fid = d["nz_source_fid"]
         obj.z_lens = d["z_lens"]
@@ -1735,7 +2369,10 @@ class FisherFlex:
         obj.omega_b_convention = cfg["omega_b_convention"]
         obj.ggl_pairs = [tuple(p) for p in cfg["ggl_pairs"]]
         obj.deriv_method = str(d["deriv_method"])
-        obj.param_deriv_method = {p: None for p in obj.param_order}
+        obj.realization_params = None
+        obj.pz_realization_offset = None
+        obj.decomposition = None
+        obj.shift_stretch = None
         obj.cosmo = None
         return obj
 
@@ -1807,6 +2444,18 @@ class FisherFlex:
                 fisher = self._add_photoz_prior_correlations(fisher, names,
                                                              prior_sigma)
 
+        if self.nz_model == "gaussian_outlier_pro":
+            # Avoid reporting ellipses from a numerically unconstrained mixture.
+            scale = np.sqrt(np.diag(fisher))
+            if np.any(scale <= 0) or not np.all(np.isfinite(scale)):
+                raise ValueError("Unconstrained gaussian_outlier_pro parameters; supply "
+                                 "calibrated priors or fix parameters with drop_params.")
+            scaled = fisher / np.outer(scale, scale)
+            eig = np.linalg.eigvalsh((scaled + scaled.T) / 2)
+            if eig[0] <= 1e-12 * eig[-1]:
+                raise ValueError("The gaussian_outlier_pro Fisher matrix is numerically "
+                                 "degenerate. Supply calibrated photoz_prior_cov, or set "
+                                 "vary_mixing=False and recompute. No prior was added.")
         return FisherFlexResult(
             fisher=fisher, param_order=names, param_labels=labels,
             param_fid={p: self.fid[p] for p in names}, mask=mask,
@@ -1923,6 +2572,22 @@ class FisherFlex:
     def _add_photoz_prior_correlations(self, fisher, names, prior_sigma):
         """Replace the diagonal photo-z prior with the full per-bin block."""
         fisher = fisher.copy()
+        if self.nz_model == "moments":
+            for b, cov in enumerate(self.pz_prior_cov):
+                group = self._pz_param_names(b)
+                positions = [j for j, name in enumerate(group) if name in names]
+                if not positions:
+                    continue
+                sd = np.sqrt(np.diag(cov))
+                corr = cov / np.outer(sd, sd)
+                # Symmetric positive definite validated before this point.
+                factor = np.linalg.cholesky(corr)
+                inverse_factor = np.linalg.solve(factor, np.eye(len(sd)))
+                precision = (inverse_factor.T @ inverse_factor) / np.outer(sd, sd)
+                idx = [names.index(group[j]) for j in positions]
+                fisher[idx, idx] -= 1.0 / prior_sigma[idx] ** 2
+                fisher[np.ix_(idx, idx)] += precision[np.ix_(positions, positions)]
+            return fisher
         for b in range(self.n_source):
             group = self._pz_param_names(b)
             if not group or not all(t in names for t in group):
