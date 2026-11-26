@@ -7,13 +7,13 @@ from fisherA2Z.fisher_flex import FisherFlex
 
 class QuantileV1PriorTests(unittest.TestCase):
     def test_validator_accepts_two_and_three_arguments(self):
-        from fisherA2Z import nz_quantiles_v1 as nq
+        from fisherA2Z import nz_quantiles as nq
         cov=np.repeat(np.eye(nq.N_PARAMS)[None],5,axis=0)
         np.testing.assert_array_equal(nq.validate_prior_cov(cov,5),
                                       nq.validate_prior_cov(cov,5,nq.N_PARAMS))
 
     def test_validator_rejects_mismatched_explicit_parameter_count(self):
-        from fisherA2Z import nz_quantiles_v1 as nq
+        from fisherA2Z import nz_quantiles as nq
         cov=np.repeat(np.eye(nq.N_PARAMS)[None],5,axis=0)
         with self.assertRaises(ValueError):nq.validate_prior_cov(cov,5,nq.N_PARAMS-1)
 

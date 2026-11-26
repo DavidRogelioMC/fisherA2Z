@@ -1,0 +1,82 @@
+"""Physical and numerical checks for bounded maximum-entropy moments."""
+import unittest
+import numpy as np
+from fisherA2Z import nz_moments as nm
+
+class MomentNumericsTests(unittest.TestCase):
+    def test_exact_polynomial_weighted_integrals_on_nonuniform_grid(self):
+        z=np.array([0., .03, .19, .71, 1.])
+        got=nm.raw_moments(z,2*z,8)
+        np.testing.assert_allclose(got,2/(np.arange(8)+2),rtol=2e-14,atol=2e-14)
+
+    def test_moment_invariance_under_linear_grid_refinement_and_amplitude(self):
+        z=np.array([0., .08, .3, .7, 1.2, 2.7, 3.])
+        n=np.array([0., .4, 1., .2, .7, .02, 0.])
+        fine=np.unique(np.concatenate([np.linspace(a,b,33) for a,b in zip(z[:-1],z[1:])]))
+        np.testing.assert_allclose(nm.raw_moments(z,n,8),
+            nm.raw_moments(fine,123*np.interp(fine,z,n),8),rtol=3e-14,atol=2e-14)
+
+    def test_uniform_density_is_maximum_entropy(self):
+        z=np.linspace(.05,3.,301)
+        model=nm.build_moment_model(z,np.ones_like(z),8)
+        np.testing.assert_allclose(model.nz_fid[0],1/(z[-1]-z[0]),atol=2e-10,rtol=2e-10)
+
+    def test_continuous_exponential_limit_converges_with_grid(self):
+        # Maximum entropy given mean on [0,1] is a truncated exponential.
+        mean=1/(1-np.exp(-1))-1
+        errors=[]
+        for size in (41,81,161):
+            z=np.linspace(0,1,size)
+            pdf=nm.evaluate_moment_nz(z,np.array([1.,mean]),np.zeros(1))
+            truth=np.exp(z)/np.expm1(1)
+            errors.append(np.trapz(np.abs(pdf-truth),z))
+            np.testing.assert_allclose(nm.raw_moments(z,pdf,2),[1.,mean],atol=1e-11)
+        self.assertLess(errors[-1],errors[0]/8)
+        self.assertLess(errors[-1],1e-4)
+
+    def test_moments_and_normalization_preserved_after_each_shift(self):
+        z=np.linspace(.01,3,301)
+        pdf=np.exp(-.5*((z-1.1)/.6)**2)+.2
+        model=nm.build_moment_model(z,pdf,8)
+        fid=model.moments[0]
+        steps=nm.recommended_steps(z,fid,.001)
+        for k,h in enumerate(steps):
+            for factor in (-2.,-1.,.5,1.,2.):
+                shift=np.zeros(7);shift[k]=factor*h
+                changed=nm.evaluate_moment_nz(z,fid,shift)
+                self.assertTrue(np.all(changed>=0))
+                np.testing.assert_allclose(np.trapz(changed,z),1.,atol=2e-12)
+                np.testing.assert_allclose(nm.raw_moments(z,changed,8),
+                    fid+np.r_[0.,shift],atol=2e-10,rtol=2e-10)
+
+    def test_smooth_function_derivative_converges(self):
+        z=np.linspace(0,3,301)
+        model=nm.build_moment_model(z,np.exp(-z)+.1,7)
+        fid=model.moments[0]; steps=nm.recommended_steps(z,fid,.003)
+        # A smooth lensing-like weight independent of the constrained polynomials.
+        kernel=np.exp(-.8*z)
+        for k in (0,5):
+            derivatives=[]
+            for scale in (1.,.5):
+                shift=np.zeros(6);shift[k]=steps[k]*scale
+                plus=nm.evaluate_moment_nz(z,fid,shift)
+                minus=nm.evaluate_moment_nz(z,fid,-shift)
+                derivatives.append(np.trapz(kernel*(plus-minus),z)/(2*shift[k]))
+            np.testing.assert_allclose(derivatives[0],derivatives[1],rtol=.002,atol=1e-7)
+
+    def test_infeasible_moments_and_changed_m0_are_rejected(self):
+        z=np.linspace(0,2,101)
+        for m in ([.9,1.,1.2],[1.,3.,10.],[1.,1.,.5],[1.,1.,8.]):
+            with self.assertRaises(ValueError):
+                nm.evaluate_moment_nz(z,np.array(m),np.zeros(2))
+
+    def test_invalid_pdfs_rejected(self):
+        z=np.linspace(0,1,20)
+        for pdf in (np.zeros(20),-np.ones(20),np.full(20,np.nan)):
+            with self.assertRaises(ValueError):nm.raw_moments(z,pdf,4)
+
+    def test_singular_and_indefinite_priors_are_not_regularized(self):
+        for cov in (np.ones((2,2)),np.array([[1.,2.],[2.,1.]]),np.zeros((2,2))):
+            with self.assertRaises(ValueError):nm.validate_prior_cov([cov],[3])
+
+if __name__=='__main__':unittest.main()

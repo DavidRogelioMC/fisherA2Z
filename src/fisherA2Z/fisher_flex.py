@@ -110,9 +110,9 @@ from . import flex_layout as fl
 from . import nz_decomposition as nzd
 from . import nz_shift_stretch as nzs
 from . import nz_moments as nzm
-from . import nz_gaussian_outlier_pro as nzg
+from . import nz_gaussian_outliers as nzg
 from . import nz_gaussian_calibration as nzgc
-from . import nz_quantiles_v1 as nzq # OJO -> LA v1 ES LA ORIGINAL CON SAMPLES
+from . import nz_quantiles as nzq 
 from .nz_decomposition import build_model_nz
 from .nz_shift_stretch import shift_stretch_nz
 
@@ -2538,6 +2538,7 @@ class FisherFlex:
         res = self.forecast(**(forecast_params or {}))
 
         m = model if model is not None else self._model()
+        np.save("tmp",self.nz_source_fid)
         d_cen = m.data_vector(self.fid, self.layout, nz_src=self.nz_source_fid)
         d_true = m.data_vector(self.fid, self.layout, nz_src=nz_truth)
 

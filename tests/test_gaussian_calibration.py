@@ -7,7 +7,7 @@ from numpy.testing import assert_allclose, assert_array_equal
 import fisherA2Z
 from fisherA2Z import fisher_flex as ff
 from fisherA2Z import nz_gaussian_calibration as cal
-from fisherA2Z import nz_gaussian_outlier_pro as go
+from fisherA2Z import nz_gaussian_outliers as go
 
 class CalibrationTests(unittest.TestCase):
     def setUp(self):

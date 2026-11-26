@@ -8,7 +8,7 @@ import numpy as np
 from numpy.testing import assert_allclose, assert_array_equal
 from scipy.special import ndtr
 
-from fisherA2Z import nz_gaussian_outlier_pro as go
+from fisherA2Z import nz_gaussian_outliers as go
 from fisherA2Z import fisher_flex as ff
 from fisherA2Z.fisher_flex import FisherFlex
 

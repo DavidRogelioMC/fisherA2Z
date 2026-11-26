@@ -103,7 +103,7 @@ def fit_ensemble(z, templates, z_real, real, c, pool=None, progress=None):
     are constructed only for one realization at a time. A supplied process
     pool must support imap; the caller manages its notebook-safe lifecycle.
     """
-    from . import nz_gaussian_outlier_pro as go
+    from . import nz_gaussian_outliers as go
     z = go._grid(z)
     z_real = go._grid(z_real)
     templates = go.normalize_nz(z, templates)

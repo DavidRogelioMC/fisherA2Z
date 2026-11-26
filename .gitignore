@@ -211,3 +211,5 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+examples/nzdc_example/source_year1_outliers_OFF_200p.npz

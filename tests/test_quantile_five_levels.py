@@ -2,7 +2,7 @@
 import pickle
 import unittest
 import numpy as np
-from fisherA2Z import nz_quantiles_v1 as nq
+from fisherA2Z import nz_quantiles as nq
 from fisherA2Z.fisher_flex import FisherFlex, _FlexModel
 
 

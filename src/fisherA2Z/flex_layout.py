@@ -277,7 +277,7 @@ def noise_power(n_lens, n_source, neff_lens, neff_source, sigma_e):
     return noise
 
 
-def gaussian_covariance(cl_all, noise, layout, nmodes):
+def migaussian_covariance(cl_all, noise, layout, nmodes):
     """Gaussian (Wick) covariance of the block data vector.
 
     .. math::

@@ -1,0 +1,42 @@
+{
+  "status": "passed",
+  "installed_module": "/home/davidmarquez/photometric_redshifts_project/fisherA2Z/src/fisherA2Z/fisher_flex.py",
+  "n_realizations": 199499,
+  "n_moments": [
+    7,
+    8,
+    4,
+    4,
+    4
+  ],
+  "prior_shapes": [
+    [
+      6,
+      6
+    ],
+    [
+      7,
+      7
+    ],
+    [
+      3,
+      3
+    ],
+    [
+      3,
+      3
+    ],
+    [
+      3,
+      3
+    ]
+  ],
+  "n_parameters": 43,
+  "z_points": 1249,
+  "ell_points": 20,
+  "parallel": true,
+  "n_proc": 2,
+  "zero_bias_control": true,
+  "elapsed_seconds": 1655.860553741455,
+  "scope": "All delivered notebook cells with all realizations and unmodified default z/ell grids; parallel two workers. Final scientific convergence across alternative resolutions remains user analysis."
+}

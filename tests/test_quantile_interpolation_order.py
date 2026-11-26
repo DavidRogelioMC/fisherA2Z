@@ -8,7 +8,7 @@ from unittest.mock import patch
 import numpy as np
 from scipy.interpolate import PchipInterpolator, PPoly
 
-from fisherA2Z import nz_quantiles_v1 as nq
+from fisherA2Z import nz_quantiles as nq
 from fisherA2Z import nz_quantiles_v2 as nq2
 from fisherA2Z import _quantile_interpolation as interpolation
 from fisherA2Z.fisher_flex import FisherFlex, _FlexModel
